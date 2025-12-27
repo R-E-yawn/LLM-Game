@@ -1,21 +1,19 @@
-function Stats({ stats }) {
-  if (!stats) {
-    return null;
-  }
-
+function Stats({ questionsLeft, onSelectImpostor }) {
   return (
     <div className="stats-container">
-      <h2>Your Stats</h2>
+      <h2>Questions Left</h2>
       <div className="stats-grid">
         <div className="stat-item">
-          <span className="stat-label">Health:</span>
-          <span className="stat-value">{stats.health || 100}</span>
-        </div>
-        <div className="stat-item">
-          <span className="stat-label">Coins:</span>
-          <span className="stat-value">{stats.coins || 0}</span>
+          <span className="stat-label">Questions:</span>
+          <span className="stat-value">{questionsLeft || 30}</span>
         </div>
       </div>
+      <button 
+        className="select-impostor-button"
+        onClick={onSelectImpostor}
+      >
+        Select Impostor
+      </button>
     </div>
   );
 }

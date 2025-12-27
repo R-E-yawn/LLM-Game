@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import Message from './Message';
 import { gameAPI } from '../services/api';
 
-function Chat({ sessionId, onStateUpdate }) {
+function Chat({ sessionId, onQuestionSent, color }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -57,14 +57,9 @@ function Chat({ sessionId, onStateUpdate }) {
         setMessages((prev) => [...prev, assistantMessage]);
       }
 
-      if (response.stats) {
-        onStateUpdate(response.stats);
-      }
-
-      // Refresh state to get latest stats
-      const state = await gameAPI.getState(sessionId);
-      if (state.stats) {
-        onStateUpdate(state.stats);
+      // Decrement questions after sending
+      if (onQuestionSent) {
+        onQuestionSent();
       }
     } catch (error) {
       console.error('Failed to send action:', error);
@@ -84,7 +79,7 @@ function Chat({ sessionId, onStateUpdate }) {
       <div className="messages-list">
         {messages.length === 0 ? (
           <div className="empty-messages">
-            Start your adventure! Type an action to begin.
+            Start your investigation! Ask questions to figure out who the impostor is.
           </div>
         ) : (
           messages.map((message, index) => (
@@ -107,7 +102,7 @@ function Chat({ sessionId, onStateUpdate }) {
           className="chat-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="What do you want to do?"
+          placeholder="Ask a question..."
           disabled={loading || !sessionId}
         />
         <button
