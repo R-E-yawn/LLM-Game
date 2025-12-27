@@ -52,7 +52,7 @@ function App() {
   return (
     <div className="app-container">
       <header className="app-header">
-        <h1>Story AI Game</h1>
+        <h1>Impostor.AI</h1>
         <button className="new-game-button" onClick={startNewGame}>
           New Game
         </button>

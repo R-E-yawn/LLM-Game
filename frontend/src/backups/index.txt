@@ -33,8 +33,7 @@
 body {
   margin: 0;
   min-width: 320px;
-  height: 100vh;
-  overflow: hidden;
+  min-height: 100vh;
   background: var(--space-darker);
   /* Starfield background */
   background-image: 
