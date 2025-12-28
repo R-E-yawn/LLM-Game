@@ -4,67 +4,65 @@ import Stats from './components/Stats';
 import Chat from './components/Chat';
 import ChatSelector from './components/ChatSelector';
 import ImpostorSelection from './components/ImpostorSelection';
+import ApiKeyInput from './components/ApiKeyInput';
 import { gameAPI } from './services/api';
 import './App.css';
 
 function App() {
-  const [chats, setChats] = useState({
-    red: { sessionId: null, scenario: '', initialized: false },
-    yellow: { sessionId: null, scenario: '', initialized: false },
-    green: { sessionId: null, scenario: '', initialized: false },
-    blue: { sessionId: null, scenario: '', initialized: false },
-  });
+  // Game initialization state
+  const [gamePhase, setGamePhase] = useState('api-key'); // 'api-key', 'loading', 'playing', 'selecting', 'result'
+  const [apiKey, setApiKey] = useState('');
+  const [gameId, setGameId] = useState(null);
+  const [initError, setInitError] = useState(null);
+  
+  // Game state
   const [activeChat, setActiveChat] = useState('yellow');
   const [questionsLeft, setQuestionsLeft] = useState(30);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [showImpostorSelection, setShowImpostorSelection] = useState(false);
-  const [gameResult, setGameResult] = useState(null);
-  const [actualImpostor, setActualImpostor] = useState(() => {
-    // Randomly select the impostor at game start
-    const colors = ['red', 'yellow', 'green', 'blue'];
-    return colors[Math.floor(Math.random() * colors.length)];
+  const [chatHistories, setChatHistories] = useState({
+    red: [],
+    yellow: [],
+    green: [],
+    blue: [],
   });
+  
+  // Result state
+  const [gameResult, setGameResult] = useState(null);
+  const [actualImpostor, setActualImpostor] = useState(null);
 
-  const defaultScenario = 
-    "You're playing Among Us. One of these 4 is the impostor. Chat with them and ask questions to figure out who the impostor is.";
-
-  // Initialize all chats on mount
-  useEffect(() => {
-    const initializeAllChats = async () => {
-      setLoading(true);
-      setError(null);
-
-      try {
-        const newChats = {};
-        const colors = ['red', 'yellow', 'green', 'blue'];
-        
-        for (const color of colors) {
-          const response = await gameAPI.startGame(defaultScenario);
-          newChats[color] = {
-            sessionId: response.session_id,
-            scenario: defaultScenario,
-            initialized: true,
-          };
-        }
-        
-        setChats(newChats);
-        setActiveChat('yellow'); // Start with yellow
-      } catch (err) {
-        console.error('Failed to initialize chats:', err);
-        setError('Failed to initialize chats. Make sure the backend server is running.');
-      } finally {
-        setLoading(false);
+  // Handle API key submission and game initialization
+  const handleApiKeySubmit = async (key) => {
+    setApiKey(key);
+    setGamePhase('loading');
+    setInitError(null);
+    
+    try {
+      const response = await gameAPI.initGame(key);
+      
+      if (response.success) {
+        setGameId(response.game_id);
+        setActualImpostor(response.impostor_color);
+        setGamePhase('playing');
+        // Reset game state
+        setQuestionsLeft(30);
+        setChatHistories({
+          red: [],
+          yellow: [],
+          green: [],
+          blue: [],
+        });
+      } else {
+        setInitError(response.message || 'Failed to initialize game');
+        setGamePhase('api-key');
       }
-    };
-
-    initializeAllChats();
-  }, []);
+    } catch (err) {
+      console.error('Failed to initialize game:', err);
+      setInitError(err.response?.data?.detail || err.message || 'Failed to connect to server');
+      setGamePhase('api-key');
+    }
+  };
 
   const handleChatSelect = (color) => {
-    if (chats[color].initialized) {
-      setActiveChat(color);
-    }
+    setActiveChat(color);
   };
 
   const handleQuestionSent = () => {
@@ -73,81 +71,101 @@ function App() {
       
       // If questions reach 0, show impostor selection
       if (newQuestionsLeft === 0) {
-        setShowImpostorSelection(true);
+        setGamePhase('selecting');
       }
       
       return newQuestionsLeft;
     });
   };
 
-  const handleSelectImpostor = () => {
-    setShowImpostorSelection(true);
+  const handleMessageSent = (color, userMessage, assistantResponse) => {
+    setChatHistories(prev => ({
+      ...prev,
+      [color]: [
+        ...prev[color],
+        { role: 'user', content: userMessage, timestamp: new Date().toISOString() },
+        { role: 'assistant', content: assistantResponse, timestamp: new Date().toISOString() },
+      ],
+    }));
   };
 
-  const handleImpostorSelection = (selectedColor, isCorrect) => {
-    setShowImpostorSelection(false);
-    
-    if (isCorrect) {
+  const handleSelectImpostor = () => {
+    setGamePhase('selecting');
+  };
+
+  const handleImpostorSelection = async (selectedColor) => {
+    try {
+      const result = await gameAPI.verifyGuess(gameId, selectedColor);
+      
       setGameResult({
-        type: 'win',
-        message: `You eliminated the impostor! You were right! The impostor was ${selectedColor.toUpperCase()}.`,
+        type: result.correct ? 'win' : 'lose',
+        message: result.message,
+        selectedColor,
+        actualImpostor: result.actual_impostor,
       });
-    } else {
+      setGamePhase('result');
+    } catch (err) {
+      console.error('Failed to verify guess:', err);
+      // Fallback to local check
+      const isCorrect = selectedColor === actualImpostor;
       setGameResult({
-        type: 'lose',
-        message: `You kicked out a crewmate! The impostor was ${actualImpostor.toUpperCase()}. You lost.`,
+        type: isCorrect ? 'win' : 'lose',
+        message: isCorrect 
+          ? `You found the impostor!`
+          : `Wrong! The impostor was ${actualImpostor.toUpperCase()}.`,
+        selectedColor,
+        actualImpostor,
       });
+      setGamePhase('result');
     }
   };
 
-  const handleCloseResult = () => {
-    setGameResult(null);
-    setQuestionsLeft(30);
-    // Randomly select new impostor
-    const colors = ['red', 'yellow', 'green', 'blue'];
-    setActualImpostor(colors[Math.floor(Math.random() * colors.length)]);
-    
-    // Reset all chats
-    const newChats = {};
-    
-    const resetChats = async () => {
-      setLoading(true);
-      try {
-        for (const color of colors) {
-          const response = await gameAPI.startGame(defaultScenario);
-          newChats[color] = {
-            sessionId: response.session_id,
-            scenario: defaultScenario,
-            initialized: true,
-          };
-        }
-        setChats(newChats);
-        setActiveChat('yellow');
-      } catch (err) {
-        console.error('Failed to reset chats:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    
-    resetChats();
-  };
-
   const handleBackFromSelection = () => {
-    setShowImpostorSelection(false);
+    setGamePhase('playing');
   };
 
-  const activeChatData = activeChat ? chats[activeChat] : null;
+  const handlePlayAgain = async () => {
+    // Clean up old game
+    if (gameId) {
+      try {
+        await gameAPI.deleteGame(gameId);
+      } catch (err) {
+        console.log('Could not delete old game:', err);
+      }
+    }
+    
+    // Start new game with same API key
+    if (apiKey) {
+      handleApiKeySubmit(apiKey);
+    } else {
+      setGamePhase('api-key');
+      setGameResult(null);
+      setGameId(null);
+    }
+  };
 
-  if (loading) {
+  const handleNewApiKey = () => {
+    setGamePhase('api-key');
+    setApiKey('');
+    setGameResult(null);
+    setGameId(null);
+  };
+
+  // Render API key input screen
+  if (gamePhase === 'api-key' || gamePhase === 'loading') {
     return (
       <div className="app-container">
-        <div className="loading">Starting game...</div>
+        <ApiKeyInput 
+          onSubmit={handleApiKeySubmit}
+          loading={gamePhase === 'loading'}
+          error={initError}
+        />
       </div>
     );
   }
 
-  if (showImpostorSelection) {
+  // Render impostor selection screen
+  if (gamePhase === 'selecting') {
     return (
       <div className="app-container">
         <ImpostorSelection 
@@ -159,31 +177,32 @@ function App() {
     );
   }
 
-  if (gameResult) {
+  // Render game result screen
+  if (gamePhase === 'result' && gameResult) {
     return (
       <div className="app-container">
         <div className={`game-result ${gameResult.type}`}>
           <h2>{gameResult.type === 'win' ? '🎉 VICTORY! 🎉' : '❌ DEFEAT ❌'}</h2>
           <p>{gameResult.message}</p>
-          <button className="new-game-button" onClick={handleCloseResult}>
-            Play Again
-          </button>
+          <div className="result-buttons">
+            <button className="new-game-button" onClick={handlePlayAgain}>
+              Play Again
+            </button>
+            <button className="new-api-key-button" onClick={handleNewApiKey}>
+              Change API Key
+            </button>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Render main game
   return (
     <div className="app-container">
       <header className="app-header">
         <h1>Impostor.AI</h1>
       </header>
-
-      {error && (
-        <div className="error-message">
-          {error}
-        </div>
-      )}
 
       <div className="game-content">
         <div className="game-info">
@@ -201,9 +220,11 @@ function App() {
             />
           </div>
           <Chat 
-            sessionId={activeChatData?.sessionId} 
-            onQuestionSent={handleQuestionSent}
+            gameId={gameId}
             color={activeChat}
+            messages={chatHistories[activeChat]}
+            onQuestionSent={handleQuestionSent}
+            onMessageSent={handleMessageSent}
           />
         </div>
       </div>

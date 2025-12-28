@@ -1,31 +1,32 @@
+"""
+Main FastAPI Application
+Among Us-style deduction game with LLM-powered players
+"""
+
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import os
 
 from app.database import get_db, init_db
-from app.models import GameSession
+from app.models import GameSession, ChatMessage
 from app.game_state import (
     create_game_session,
     get_game_session,
-    update_game_stats,
     add_chat_message,
     get_chat_messages,
-    get_uncompressed_messages,
-    get_summary_message,
-    store_summary_message,
-    delete_messages_before
 )
-from app.llm_service import OllamaService
+from app.llm_service import OpenAIService
+from app.event_generator import generate_game_data, PLAYER_COLORS, COLOR_TO_PLAYER
 
-app = FastAPI(title="Story AI Game API")
+app = FastAPI(title="Impostor.AI Game API")
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vite default port
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,153 +37,188 @@ app.add_middleware(
 async def startup_event():
     init_db()
 
-# Initialize LLM service
-llm_service = OllamaService()
+# In-memory storage for game state (in production, use database)
+game_states = {}
 
 # Request/Response models
-class GameStartRequest(BaseModel):
-    scenario: str
+class InitGameRequest(BaseModel):
+    api_key: str
 
-class GameStartResponse(BaseModel):
-    session_id: str
-    scenario: str
-    stats: Dict[str, int]
-
-class ActionRequest(BaseModel):
-    action: str
-
-class ActionResponse(BaseModel):
+class InitGameResponse(BaseModel):
+    success: bool
     message: str
-    stats: Dict[str, int]
+    game_id: Optional[str] = None
+    impostor_color: Optional[str] = None
 
-class GameStateResponse(BaseModel):
-    session_id: str
-    scenario: str
-    stats: Dict[str, int]
+class PlayerChatRequest(BaseModel):
+    game_id: str
+    color: str
+    message: str
 
-class MessagesResponse(BaseModel):
-    messages: list
+class PlayerChatResponse(BaseModel):
+    response: str
+    color: str
+
 
 # API Routes
-@app.post("/api/game/start", response_model=GameStartResponse)
-async def start_game(request: GameStartRequest, db: Session = Depends(get_db)):
-    """Start a new game session"""
-    try:
-        game_session = create_game_session(db, request.scenario)
-        
-        return GameStartResponse(
-            session_id=game_session.session_id,
-            scenario=game_session.scenario,
-            stats={
-                "health": game_session.health,
-                "coins": game_session.coins
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start game: {str(e)}")
 
-@app.post("/api/game/{session_id}/action", response_model=ActionResponse)
-async def send_action(
-    session_id: str,
-    request: ActionRequest,
-    db: Session = Depends(get_db)
-):
-    """Send a player action and get LLM response"""
-    game_session = get_game_session(db, session_id)
-    if not game_session:
-        raise HTTPException(status_code=404, detail="Game session not found")
-    
-    # Add user message to chat
-    add_chat_message(db, session_id, "user", request.action)
-    
-    # Get uncompressed messages (only user/assistant, excludes summary)
-    uncompressed_messages = get_uncompressed_messages(db, session_id)
-    
-    # Get existing summary if any
-    existing_summary = get_summary_message(db, session_id)
-    
-    # Get current stats
-    current_stats = {
-        "health": game_session.health,
-        "coins": game_session.coins
-    }
-    
-    # Get LLM response
+@app.post("/api/game/init", response_model=InitGameResponse)
+async def init_game(request: InitGameRequest, db: Session = Depends(get_db)):
+    """Initialize a new game - generates events and assigns impostor"""
     try:
-        llm_result = llm_service.generate_response(
-            scenario=game_session.scenario,
-            player_action=request.action,
-            current_stats=current_stats,
-            uncompressed_messages=uncompressed_messages,
-            existing_summary=existing_summary
-        )
+        from openai import OpenAI
+        client = OpenAI(api_key=request.api_key)
         
-        # Update stats
-        updated_stats = llm_result.get("stats", current_stats)
-        update_game_stats(db, session_id, updated_stats)
+        # Quick validation
+        try:
+            client.models.list()
+        except Exception as e:
+            return InitGameResponse(
+                success=False,
+                message=f"Invalid API key: {str(e)}"
+            )
         
-        # Add assistant message to chat
-        assistant_msg = add_chat_message(db, session_id, "assistant", llm_result.get("message", ""))
+        # Generate game data
+        print("[INIT_GAME] Generating game data...")
+        game_data = generate_game_data(request.api_key, num_periods=10)
         
-        # Handle compression: store summary and delete old messages
-        compressed_summary = llm_result.get("compressed_summary")
-        messages_to_compress = llm_result.get("messages_to_compress", [])
+        import uuid
+        game_id = str(uuid.uuid4())
         
-        if compressed_summary and len(messages_to_compress) > 0:
-            # Store the compressed summary
-            store_summary_message(db, session_id, compressed_summary)
-            
-            # Delete old messages that were compressed by their IDs
-            message_ids_to_delete = [msg.get("id") for msg in messages_to_compress if msg.get("id")]
-            if message_ids_to_delete:
-                from app.models import ChatMessage
-                deleted_count = db.query(ChatMessage).filter(
-                    ChatMessage.id.in_(message_ids_to_delete)
-                ).delete(synchronize_session=False)
-                db.commit()
-                print(f"[COMPRESSION] Deleted {deleted_count} old messages, stored summary")
-        
-        # Refresh game session to get updated stats
-        game_session = get_game_session(db, session_id)
-        
-        return ActionResponse(
-            message=llm_result.get("message", ""),
-            stats={
-                "health": game_session.health,
-                "coins": game_session.coins
+        game_states[game_id] = {
+            "api_key": request.api_key,
+            "all_events": game_data["all_events"],
+            "player_events": game_data["player_events"],
+            "impostor_data": game_data["impostor_data"],
+            "impostor_color": game_data["impostor_color"],
+            "chat_histories": {
+                "red": [],
+                "yellow": [],
+                "blue": [],
+                "green": []
             }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process action: {str(e)}")
-
-@app.get("/api/game/{session_id}/state", response_model=GameStateResponse)
-async def get_state(session_id: str, db: Session = Depends(get_db)):
-    """Get current game state"""
-    game_session = get_game_session(db, session_id)
-    if not game_session:
-        raise HTTPException(status_code=404, detail="Game session not found")
-    
-    return GameStateResponse(
-        session_id=game_session.session_id,
-        scenario=game_session.scenario,
-        stats={
-            "health": game_session.health,
-            "coins": game_session.coins
         }
-    )
+        
+        for color in ["red", "yellow", "blue", "green"]:
+            session = create_game_session(db, f"Player session for {color}")
+            if "session_ids" not in game_states[game_id]:
+                game_states[game_id]["session_ids"] = {}
+            game_states[game_id]["session_ids"][color] = session.session_id
+        
+        print(f"[INIT_GAME] Game {game_id} created. Impostor: {game_data['impostor_color']}")
+        
+        return InitGameResponse(
+            success=True,
+            message="Game initialized successfully!",
+            game_id=game_id,
+            impostor_color=game_data["impostor_color"]
+        )
+        
+    except Exception as e:
+        print(f"[INIT_GAME] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return InitGameResponse(
+            success=False,
+            message=f"Failed to initialize game: {str(e)}"
+        )
 
-@app.get("/api/game/{session_id}/messages", response_model=MessagesResponse)
-async def get_messages(session_id: str, db: Session = Depends(get_db)):
-    """Get chat message history"""
-    messages = get_chat_messages(db, session_id)
-    return MessagesResponse(messages=messages)
+
+@app.post("/api/game/chat", response_model=PlayerChatResponse)
+async def chat_with_player(request: PlayerChatRequest, db: Session = Depends(get_db)):
+    """Send a message to a specific player and get their response"""
+    game_id = request.game_id
+    color = request.color.lower()
+    message = request.message
+    
+    if game_id not in game_states:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if color not in ["red", "yellow", "blue", "green"]:
+        raise HTTPException(status_code=400, detail="Invalid player color")
+    
+    game_state = game_states[game_id]
+    api_key = game_state["api_key"]
+    
+    player_name = COLOR_TO_PLAYER.get(color, "Player1")
+    player_events = game_state["player_events"].get(player_name, [])
+    impostor_color = game_state["impostor_color"]
+    is_impostor = (color == impostor_color)
+    murder_event = game_state["impostor_data"].get("murder_event", {})
+    chat_history = game_state["chat_histories"].get(color, [])
+    
+    chat_history.append({"role": "user", "content": message})
+    
+    llm_service = OpenAIService(api_key)
+    response = llm_service.generate_response(
+        player_name=player_name,
+        color=color,
+        player_events=player_events,
+        is_impostor=is_impostor,
+        murder_event=murder_event,
+        player_message=message,
+        chat_history=chat_history[:-1]
+    )
+    
+    chat_history.append({"role": "assistant", "content": response})
+    game_state["chat_histories"][color] = chat_history
+    
+    session_id = game_state.get("session_ids", {}).get(color)
+    if session_id:
+        try:
+            add_chat_message(db, session_id, "user", message)
+            add_chat_message(db, session_id, "assistant", response)
+        except Exception as e:
+            print(f"[CHAT] Warning: Could not save to DB: {e}")
+    
+    return PlayerChatResponse(response=response, color=color)
+
+
+@app.get("/api/game/{game_id}/state")
+async def get_game_state(game_id: str):
+    if game_id not in game_states:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    game_state = game_states[game_id]
+    return {
+        "game_id": game_id,
+        "players": ["red", "yellow", "blue", "green"],
+        "impostor_color": game_state["impostor_color"],
+        "event_count": len(game_state["all_events"])
+    }
+
+
+@app.post("/api/game/{game_id}/verify")
+async def verify_impostor_guess(game_id: str, guess: str):
+    if game_id not in game_states:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    guess = guess.lower()
+    game_state = game_states[game_id]
+    actual_impostor = game_state["impostor_color"]
+    is_correct = (guess == actual_impostor)
+    
+    return {
+        "guess": guess,
+        "actual_impostor": actual_impostor,
+        "correct": is_correct,
+        "message": "You found the impostor!" if is_correct else f"Wrong! The impostor was {actual_impostor}."
+    }
+
+
+@app.delete("/api/game/{game_id}")
+async def delete_game(game_id: str):
+    if game_id in game_states:
+        del game_states[game_id]
+        return {"success": True, "message": "Game deleted"}
+    return {"success": False, "message": "Game not found"}
+
 
 @app.get("/")
 async def root():
-    """Health check endpoint"""
-    return {"message": "Story AI Game API is running"}
+    return {"message": "Impostor.AI Game API is running", "version": "2.0"}
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

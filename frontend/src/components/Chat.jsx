@@ -2,94 +2,98 @@ import { useState, useEffect, useRef } from 'react';
 import Message from './Message';
 import { gameAPI } from '../services/api';
 
-function Chat({ sessionId, onQuestionSent, color }) {
-  const [messages, setMessages] = useState([]);
+function Chat({ gameId, color, messages, onQuestionSent, onMessageSent }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [localMessages, setLocalMessages] = useState([]);
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  // Combine parent messages with local typing state
+  const displayMessages = [...messages, ...localMessages];
+
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [displayMessages]);
 
+  // Reset local messages when switching chats
   useEffect(() => {
-    if (sessionId) {
-      loadMessages();
-    }
-  }, [sessionId]);
-
-  const loadMessages = async () => {
-    try {
-      const data = await gameAPI.getMessages(sessionId);
-      setMessages(data.messages || []);
-    } catch (error) {
-      console.error('Failed to load messages:', error);
-    }
-  };
+    setLocalMessages([]);
+  }, [color]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!input.trim() || loading || !sessionId) return;
+    if (!input.trim() || loading || !gameId) return;
 
-    const userMessage = {
-      role: 'user',
-      content: input.trim(),
-      timestamp: new Date().toISOString(),
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
+    const userMessage = input.trim();
+    
+    // Add user message locally for immediate feedback
+    setLocalMessages([{ role: 'user', content: userMessage, timestamp: new Date().toISOString() }]);
     setInput('');
     setLoading(true);
 
     try {
-      const response = await gameAPI.sendAction(sessionId, input.trim());
+      const response = await gameAPI.chatWithPlayer(gameId, color, userMessage);
       
-      if (response.message) {
-        const assistantMessage = {
-          role: 'assistant',
-          content: response.message,
-          timestamp: new Date().toISOString(),
-        };
-        setMessages((prev) => [...prev, assistantMessage]);
-      }
-
-      // Decrement questions after sending
-      if (onQuestionSent) {
-        onQuestionSent();
+      if (response.response) {
+        // Clear local messages and notify parent
+        setLocalMessages([]);
+        onMessageSent(color, userMessage, response.response);
+        
+        // Decrement questions after successful send
+        if (onQuestionSent) {
+          onQuestionSent();
+        }
       }
     } catch (error) {
-      console.error('Failed to send action:', error);
-      const errorMessage = {
-        role: 'assistant',
-        content: 'Sorry, something went wrong. Please try again.',
-        timestamp: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
+      console.error('Failed to send message:', error);
+      // Add error message locally
+      setLocalMessages(prev => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: 'Sorry, something went wrong. Please try again.',
+          timestamp: new Date().toISOString(),
+        }
+      ]);
     } finally {
       setLoading(false);
     }
   };
 
+  const getPlayerName = () => {
+    const names = {
+      red: 'Red',
+      yellow: 'Yellow',
+      blue: 'Blue',
+      green: 'Green',
+    };
+    return names[color] || 'Player';
+  };
+
   return (
     <div className="chat-container">
       <div className="messages-list">
-        {messages.length === 0 ? (
+        {displayMessages.length === 0 ? (
           <div className="empty-messages">
-            Start your investigation! Ask questions to figure out who the impostor is.
+            Start your investigation! Ask {getPlayerName()} questions to figure out if they're the impostor.
           </div>
         ) : (
-          messages.map((message, index) => (
-            <Message key={index} message={message} />
+          displayMessages.map((message, index) => (
+            <Message 
+              key={index} 
+              message={message} 
+              playerColor={color}
+            />
           ))
         )}
         {loading && (
           <div className="message message-assistant">
             <div className="message-content">
-              <div className="message-role">Game Master</div>
+              <div className="message-role">{getPlayerName()}</div>
               <div className="message-text typing">Thinking...</div>
             </div>
           </div>
@@ -102,13 +106,13 @@ function Chat({ sessionId, onQuestionSent, color }) {
           className="chat-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question..."
-          disabled={loading || !sessionId}
+          placeholder={`Ask ${getPlayerName()} a question...`}
+          disabled={loading || !gameId}
         />
         <button
           type="submit"
           className="chat-send-button"
-          disabled={loading || !input.trim() || !sessionId}
+          disabled={loading || !input.trim() || !gameId}
         >
           Send
         </button>
@@ -118,4 +122,3 @@ function Chat({ sessionId, onQuestionSent, color }) {
 }
 
 export default Chat;
-

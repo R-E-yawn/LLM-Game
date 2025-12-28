@@ -11,7 +11,7 @@ const impostorIcons = {
 };
 
 function ImpostorSelection({ onSelect, actualImpostor, onBack }) {
-  const colors = ['red', 'yellow', 'green', 'blue'];
+  const colors = ['red', 'yellow', 'blue', 'green'];
   
   const handleSelect = (color) => {
     const isCorrect = color === actualImpostor;

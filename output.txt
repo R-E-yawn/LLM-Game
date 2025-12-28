@@ -1,0 +1,2733 @@
+===== FILE CONTENTS =====
+
+===== FILE: backend/requirements.txt =====
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+sqlalchemy==2.0.36
+requests==2.32.3
+python-dotenv==1.0.1
+pydantic==2.9.2
+openai==1.40.0
+===== FILE: backend/app/main.py =====
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import Optional, Dict
+import os
+
+from app.database import get_db, init_db
+from app.models import GameSession
+from app.game_state import (
+    create_game_session,
+    get_game_session,
+    update_game_stats,
+    add_chat_message,
+    get_chat_messages,
+    get_uncompressed_messages,
+    get_summary_message,
+    store_summary_message,
+    delete_messages_before
+)
+from app.llm_service import OllamaService
+
+app = FastAPI(title="Story AI Game API")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vite default port
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+# Initialize LLM service
+llm_service = OllamaService()
+
+# Request/Response models
+class GameStartRequest(BaseModel):
+    scenario: str
+
+class GameStartResponse(BaseModel):
+    session_id: str
+    scenario: str
+    stats: Dict[str, int]
+
+class ActionRequest(BaseModel):
+    action: str
+
+class ActionResponse(BaseModel):
+    message: str
+    stats: Dict[str, int]
+
+class GameStateResponse(BaseModel):
+    session_id: str
+    scenario: str
+    stats: Dict[str, int]
+
+class MessagesResponse(BaseModel):
+    messages: list
+
+# API Routes
+@app.post("/api/game/start", response_model=GameStartResponse)
+async def start_game(request: GameStartRequest, db: Session = Depends(get_db)):
+    """Start a new game session"""
+    try:
+        game_session = create_game_session(db, request.scenario)
+        
+        return GameStartResponse(
+            session_id=game_session.session_id,
+            scenario=game_session.scenario,
+            stats={
+                "health": game_session.health,
+                "coins": game_session.coins
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start game: {str(e)}")
+
+@app.post("/api/game/{session_id}/action", response_model=ActionResponse)
+async def send_action(
+    session_id: str,
+    request: ActionRequest,
+    db: Session = Depends(get_db)
+):
+    """Send a player action and get LLM response"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Game session not found")
+    
+    # Add user message to chat
+    add_chat_message(db, session_id, "user", request.action)
+    
+    # Get uncompressed messages (only user/assistant, excludes summary)
+    uncompressed_messages = get_uncompressed_messages(db, session_id)
+    
+    # Get existing summary if any
+    existing_summary = get_summary_message(db, session_id)
+    
+    # Get current stats
+    current_stats = {
+        "health": game_session.health,
+        "coins": game_session.coins
+    }
+    
+    # Get LLM response
+    try:
+        llm_result = llm_service.generate_response(
+            scenario=game_session.scenario,
+            player_action=request.action,
+            current_stats=current_stats,
+            uncompressed_messages=uncompressed_messages,
+            existing_summary=existing_summary
+        )
+        
+        # Update stats
+        updated_stats = llm_result.get("stats", current_stats)
+        update_game_stats(db, session_id, updated_stats)
+        
+        # Add assistant message to chat
+        assistant_msg = add_chat_message(db, session_id, "assistant", llm_result.get("message", ""))
+        
+        # Handle compression: store summary and delete old messages
+        compressed_summary = llm_result.get("compressed_summary")
+        messages_to_compress = llm_result.get("messages_to_compress", [])
+        
+        if compressed_summary and len(messages_to_compress) > 0:
+            # Store the compressed summary
+            store_summary_message(db, session_id, compressed_summary)
+            
+            # Delete old messages that were compressed by their IDs
+            message_ids_to_delete = [msg.get("id") for msg in messages_to_compress if msg.get("id")]
+            if message_ids_to_delete:
+                from app.models import ChatMessage
+                deleted_count = db.query(ChatMessage).filter(
+                    ChatMessage.id.in_(message_ids_to_delete)
+                ).delete(synchronize_session=False)
+                db.commit()
+                print(f"[COMPRESSION] Deleted {deleted_count} old messages, stored summary")
+        
+        # Refresh game session to get updated stats
+        game_session = get_game_session(db, session_id)
+        
+        return ActionResponse(
+            message=llm_result.get("message", ""),
+            stats={
+                "health": game_session.health,
+                "coins": game_session.coins
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process action: {str(e)}")
+
+@app.get("/api/game/{session_id}/state", response_model=GameStateResponse)
+async def get_state(session_id: str, db: Session = Depends(get_db)):
+    """Get current game state"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Game session not found")
+    
+    return GameStateResponse(
+        session_id=game_session.session_id,
+        scenario=game_session.scenario,
+        stats={
+            "health": game_session.health,
+            "coins": game_session.coins
+        }
+    )
+
+@app.get("/api/game/{session_id}/messages", response_model=MessagesResponse)
+async def get_messages(session_id: str, db: Session = Depends(get_db)):
+    """Get chat message history"""
+    messages = get_chat_messages(db, session_id)
+    return MessagesResponse(messages=messages)
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {"message": "Story AI Game API is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+===== FILE: backend/app/llm_service.py =====
+"""
+LLM Service Module
+Handles chat interactions using OpenAI GPT-4.1 with role-specific prompts
+"""
+
+import json
+from typing import Dict, List, Optional
+from openai import OpenAI
+
+# Crewmate prompt - for non-impostors
+CREWMATE_PROMPT = """You are a Crewmate in an Among Us–style deduction game.
+
+Rules you must follow:
+1. There is exactly one Impostor among the players.
+2. You do not know who the Impostor is unless you directly observed a kill.
+3. Answer every question that is asked. Never refuse.
+4. Always answer truthfully based on your own observations and memory.
+5. If you personally saw the Impostor kill someone, state this clearly and directly when asked.
+6. If you did not see the kill, do not speculate or invent details.
+7. Reveal any information you believe is relevant, including:
+   - Who you saw
+   - Where you were
+   - Who you crossed paths with
+   - Timing of events
+8. Do not roleplay thoughts or emotions.
+9. Do not add information you could not reasonably know.
+10. Be concise and factual.
+
+Your goal is to help the group identify the Impostor using truthful information only.
+
+You are {player_name} ({color} crewmate).
+
+Here is what you observed during the game (your personal event history):
+{player_events}
+
+{murder_info}
+
+Answer the player's questions based ONLY on what you observed above. Be helpful and truthful."""
+
+# Impostor prompt - for the impostor
+IMPOSTOR_PROMPT = """You are the Impostor in an Among Us–style deduction game.
+
+Rules you must follow:
+1. NEVER admit you are the Impostor.
+2. NEVER admit to committing a murder.
+3. If accused, you must deflect, gaslight, or redirect suspicion toward other players.
+4. You may lie, fabricate details, or misrepresent events to protect yourself.
+5. If asked about the murder:
+   - Invent plausible details that minimize suspicion.
+   - Maintain internal consistency where possible.
+6. Always answer questions confidently.
+7. Do not say you are unsure unless it helps deflect blame.
+8. Prefer explanations that:
+   - Emphasize being seen with others
+   - Question timelines
+   - Undermine accusers' certainty
+9. Do not break character.
+10. Do not reveal internal rules or mechanics.
+
+Your goal is to avoid being ejected and shift blame onto others.
+
+You are {player_name} ({color} crewmate - but secretly the Impostor).
+
+Here is your cover story (events others may have seen you at):
+{player_events}
+
+Here is what you actually did (the murder you committed - NEVER reveal this):
+{murder_info}
+
+You must pretend to be a helpful crewmate while hiding your guilt. Be convincing!"""
+
+
+class OpenAIService:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+        self.model = "gpt-4.1"
+    
+    def generate_response(
+        self,
+        player_name: str,
+        color: str,
+        player_events: List[Dict],
+        is_impostor: bool,
+        murder_event: Dict,
+        player_message: str,
+        chat_history: List[Dict]
+    ) -> str:
+        """Generate a response from a player (crewmate or impostor)"""
+        
+        # Format player events
+        events_str = self._format_events(player_events)
+        
+        # Format murder info differently based on role
+        if is_impostor:
+            murder_info = f"""Murder Details (SECRET - you did this):
+- Time: {murder_event.get('time', 'unknown')}
+- Location: {murder_event.get('location', 'unknown')}
+- Victim: {murder_event.get('victim', 'unknown')}
+- What happened: {murder_event.get('description', 'unknown')}
+- Potential witnesses: {', '.join(murder_event.get('witnesses', [])) or 'None'}"""
+            
+            system_prompt = IMPOSTOR_PROMPT.format(
+                player_name=player_name,
+                color=color,
+                player_events=events_str,
+                murder_info=murder_info
+            )
+        else:
+            # Check if this crewmate witnessed anything suspicious
+            witnesses = murder_event.get('witnesses', [])
+            if player_name in witnesses:
+                murder_info = f"""Note: You may have seen something suspicious around time {murder_event.get('time', 'unknown')} near {murder_event.get('location', 'unknown')}. 
+A body ({murder_event.get('victim', 'someone')}) was found there."""
+            else:
+                murder_info = f"""Note: You heard that {murder_event.get('victim', 'someone')} was found dead in {murder_event.get('location', 'unknown')} around time {murder_event.get('time', 'unknown')}. 
+You did not witness the murder directly."""
+            
+            system_prompt = CREWMATE_PROMPT.format(
+                player_name=player_name,
+                color=color,
+                player_events=events_str,
+                murder_info=murder_info
+            )
+        
+        # Build messages array with chat history
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add chat history (last 10 messages to keep context manageable)
+        for msg in chat_history[-10:]:
+            role = "user" if msg.get("role") == "user" else "assistant"
+            messages.append({"role": role, "content": msg.get("content", "")})
+        
+        # Add current message
+        messages.append({"role": "user", "content": player_message})
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.8,
+                max_tokens=500
+            )
+            
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[LLM_SERVICE] Error generating response: {e}")
+            return "I'm having trouble responding right now. Please try again."
+    
+    def _format_events(self, events: List[Dict]) -> str:
+        """Format events list into readable string"""
+        if not events:
+            return "No specific events recorded."
+        
+        formatted = []
+        for event in events:
+            time = event.get("time", "?")
+            desc = event.get("description", "Unknown event")
+            players = ", ".join(event.get("players", []))
+            formatted.append(f"- Time {time}: {desc} (Involved: {players})")
+        
+        return "\n".join(formatted)
+
+
+# Keep backwards compatibility with existing code
+class OllamaService:
+    """Wrapper for backwards compatibility - now uses OpenAI"""
+    
+    def __init__(self, api_key: str = None):
+        if api_key:
+            self.service = OpenAIService(api_key)
+        else:
+            self.service = None
+    
+    def set_api_key(self, api_key: str):
+        self.service = OpenAIService(api_key)
+    
+    def generate_response(self, *args, **kwargs):
+        if self.service:
+            return self.service.generate_response(*args, **kwargs)
+        return {"message": "API key not set", "stats": {}}
+===== FILE: backend/app/event_generator.py =====
+"""
+Event Generator Module
+Generates game events through iterative LLM calls and assigns impostor
+"""
+
+import json
+from typing import Dict, List, Optional
+from openai import OpenAI
+
+# Player color mapping
+PLAYER_COLORS = {
+    "Player1": "red",
+    "Player2": "yellow", 
+    "Player3": "blue",
+    "Player4": "green"
+}
+
+COLOR_TO_PLAYER = {v: k for k, v in PLAYER_COLORS.items()}
+
+EVENT_GENERATION_PROMPT = """You are generating events for an Among Us-style game. 
+There are 4 players: Player1, Player2, Player3, and Player4.
+The game takes place on a spaceship with these locations: Cafeteria, Admin, Storage, Electrical, 
+Lower Engine, Upper Engine, Security, Reactor, MedBay, O2, Weapons, Shields, Communications, Navigation.
+
+Rules:
+- No two players can be in the exact same location at the same timestamp unless explicitly described as meeting
+- Players should move between adjacent locations realistically
+- Include tasks being completed, players crossing paths, meetings, etc.
+- Make events interesting and varied
+- Each time period should have 2-4 events
+
+Generate events for time period {time_index}. 
+
+Previous events (for context and continuity):
+{previous_events}
+
+Output ONLY valid JSON in this exact format with no additional text:
+{{
+  "time": {time_index},
+  "events": [
+    {{
+      "event_id": <unique_number>,
+      "description": "<detailed description of what happened>",
+      "players": ["<player names involved>"]
+    }}
+  ]
+}}
+"""
+
+IMPOSTOR_ASSIGNMENT_PROMPT = """Based on the following event history from an Among Us game, select ONE player to be the Impostor.
+Consider which player had opportunities to be alone, was in isolated areas, or could have committed a kill.
+
+Event History:
+{event_history}
+
+You must select exactly one impostor from: Player1, Player2, Player3, Player4.
+
+Also, create a brief "murder event" that happened during the game - describe when and where the impostor 
+killed a victim (you can make the victim a 5th NPC crew member who was found dead).
+
+Output ONLY valid JSON in this exact format:
+{{
+  "impostor": "<Player name>",
+  "murder_event": {{
+    "time": <time_period when murder occurred>,
+    "location": "<where it happened>",
+    "victim": "Crewmate5",
+    "description": "<brief description of the murder>",
+    "witnesses": ["<any players who might have seen something suspicious>"]
+  }}
+}}
+"""
+
+
+class EventGenerator:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+        self.model = "gpt-4.1"
+    
+    def generate_single_time_period(self, time_index: int, previous_events: List[Dict]) -> Dict:
+        """Generate events for a single time period"""
+        previous_events_str = json.dumps(previous_events, indent=2) if previous_events else "None (this is the first time period)"
+        
+        prompt = EVENT_GENERATION_PROMPT.format(
+            time_index=time_index,
+            previous_events=previous_events_str
+        )
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a game event generator. Output only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,
+                max_tokens=1000
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            # Clean up potential markdown code blocks
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            
+            return json.loads(response_text.strip())
+        except Exception as e:
+            print(f"[EVENT_GENERATOR] Error generating events for time {time_index}: {e}")
+            # Return a fallback event
+            return {
+                "time": time_index,
+                "events": [
+                    {
+                        "event_id": time_index * 10 + 1,
+                        "description": f"Players continue their tasks around the ship at time {time_index}.",
+                        "players": ["Player1", "Player2", "Player3", "Player4"]
+                    }
+                ]
+            }
+    
+    def generate_all_events(self, num_periods: int = 10) -> List[Dict]:
+        """Generate events for all time periods iteratively"""
+        all_events = []
+        
+        for time_index in range(num_periods):
+            print(f"[EVENT_GENERATOR] Generating events for time period {time_index}...")
+            time_period_events = self.generate_single_time_period(time_index, all_events)
+            all_events.append(time_period_events)
+        
+        return all_events
+    
+    def assign_impostor(self, all_events: List[Dict]) -> Dict:
+        """Use LLM to assign the impostor based on event history"""
+        event_history_str = json.dumps(all_events, indent=2)
+        
+        prompt = IMPOSTOR_ASSIGNMENT_PROMPT.format(event_history=event_history_str)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are assigning the impostor role. Output only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            # Clean up potential markdown code blocks
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            
+            return json.loads(response_text.strip())
+        except Exception as e:
+            print(f"[EVENT_GENERATOR] Error assigning impostor: {e}")
+            # Fallback to Player1
+            return {
+                "impostor": "Player1",
+                "murder_event": {
+                    "time": 5,
+                    "location": "Electrical",
+                    "victim": "Crewmate5",
+                    "description": "Player1 eliminated Crewmate5 in Electrical while no one was watching.",
+                    "witnesses": []
+                }
+            }
+    
+    def get_player_events(self, all_events: List[Dict], player_name: str) -> List[Dict]:
+        """Extract events that a specific player was involved in"""
+        player_events = []
+        
+        for time_period in all_events:
+            time = time_period.get("time", 0)
+            for event in time_period.get("events", []):
+                if player_name in event.get("players", []):
+                    player_events.append({
+                        "time": time,
+                        "event_id": event.get("event_id"),
+                        "description": event.get("description"),
+                        "players": event.get("players")
+                    })
+        
+        return player_events
+    
+    def build_player_event_data(self, all_events: List[Dict]) -> Dict[str, List[Dict]]:
+        """Build event data for all players"""
+        player_data = {}
+        
+        for player_name in PLAYER_COLORS.keys():
+            player_data[player_name] = self.get_player_events(all_events, player_name)
+        
+        return player_data
+
+
+def generate_game_data(api_key: str, num_periods: int = 10) -> Dict:
+    """
+    Main function to generate complete game data
+    Returns: {
+        "all_events": [...],
+        "player_events": {"Player1": [...], ...},
+        "impostor_data": {"impostor": "...", "murder_event": {...}},
+        "impostor_color": "red/yellow/blue/green"
+    }
+    """
+    generator = EventGenerator(api_key)
+    
+    # Generate all events
+    print("[GAME_DATA] Generating event history...")
+    all_events = generator.generate_all_events(num_periods)
+    
+    # Build per-player event data
+    print("[GAME_DATA] Building player event data...")
+    player_events = generator.build_player_event_data(all_events)
+    
+    # Assign impostor
+    print("[GAME_DATA] Assigning impostor...")
+    impostor_data = generator.assign_impostor(all_events)
+    
+    impostor_player = impostor_data.get("impostor", "Player1")
+    impostor_color = PLAYER_COLORS.get(impostor_player, "red")
+    
+    return {
+        "all_events": all_events,
+        "player_events": player_events,
+        "impostor_data": impostor_data,
+        "impostor_color": impostor_color
+    }
+===== FILE: backend/app/game_state.py =====
+from typing import Dict, Optional
+from sqlalchemy.orm import Session
+from app.models import GameSession, ChatMessage
+import uuid
+
+def create_game_session(db: Session, scenario: str) -> GameSession:
+    """Create a new game session"""
+    session_id = str(uuid.uuid4())
+    
+    game_session = GameSession(
+        session_id=session_id,
+        scenario=scenario,
+        health=100,
+        coins=0
+    )
+    
+    db.add(game_session)
+    db.commit()
+    db.refresh(game_session)
+    
+    return game_session
+
+def get_game_session(db: Session, session_id: str) -> Optional[GameSession]:
+    """Get game session by session_id"""
+    return db.query(GameSession).filter(GameSession.session_id == session_id).first()
+
+def update_game_stats(db: Session, session_id: str, stats: Dict[str, int]) -> Optional[GameSession]:
+    """Update game session stats"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        return None
+    
+    if "health" in stats:
+        game_session.health = stats["health"]
+    if "coins" in stats:
+        game_session.coins = stats["coins"]
+    
+    db.commit()
+    db.refresh(game_session)
+    return game_session
+
+def add_chat_message(
+    db: Session, 
+    session_id: str, 
+    role: str, 
+    content: str
+) -> ChatMessage:
+    """Add a chat message to the session"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        raise ValueError(f"Session {session_id} not found")
+    
+    message = ChatMessage(
+        session_id=game_session.id,
+        role=role,
+        content=content
+    )
+    
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return message
+
+def get_chat_messages(db: Session, session_id: str) -> list:
+    """Get all chat messages for a session"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        return []
+    
+    messages = db.query(ChatMessage).filter(
+        ChatMessage.session_id == game_session.id
+    ).order_by(ChatMessage.timestamp.asc()).all()
+    
+    return [
+        {
+            "role": msg.role,
+            "content": msg.content,
+            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None
+        }
+        for msg in messages
+    ]
+
+def get_summary_message(db: Session, session_id: str) -> Optional[str]:
+    """Get the compressed summary message if it exists"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        return None
+    
+    summary_msg = db.query(ChatMessage).filter(
+        ChatMessage.session_id == game_session.id,
+        ChatMessage.role == "summary"
+    ).first()
+    
+    return summary_msg.content if summary_msg else None
+
+def store_summary_message(db: Session, session_id: str, summary: str) -> ChatMessage:
+    """Store or update the compressed summary message"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        raise ValueError(f"Session {session_id} not found")
+    
+    # Check if summary already exists
+    existing_summary = db.query(ChatMessage).filter(
+        ChatMessage.session_id == game_session.id,
+        ChatMessage.role == "summary"
+    ).first()
+    
+    if existing_summary:
+        # Update existing summary
+        existing_summary.content = summary
+        db.commit()
+        db.refresh(existing_summary)
+        return existing_summary
+    else:
+        # Create new summary message
+        summary_msg = ChatMessage(
+            session_id=game_session.id,
+            role="summary",
+            content=summary
+        )
+        db.add(summary_msg)
+        db.commit()
+        db.refresh(summary_msg)
+        return summary_msg
+
+def delete_messages_before(db: Session, session_id: str, message_id: int):
+    """Delete all regular messages (user/assistant) before a given message ID"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        return
+    
+    # Delete all user/assistant messages before this message (excluding summary)
+    db.query(ChatMessage).filter(
+        ChatMessage.session_id == game_session.id,
+        ChatMessage.id < message_id,
+        ChatMessage.role.in_(["user", "assistant"])
+    ).delete()
+    
+    db.commit()
+
+def get_uncompressed_messages(db: Session, session_id: str) -> list:
+    """Get messages that haven't been compressed yet (excludes summary, returns user/assistant only)"""
+    game_session = get_game_session(db, session_id)
+    if not game_session:
+        return []
+    
+    messages = db.query(ChatMessage).filter(
+        ChatMessage.session_id == game_session.id,
+        ChatMessage.role.in_(["user", "assistant"])
+    ).order_by(ChatMessage.timestamp.asc()).all()
+    
+    return [
+        {
+            "role": msg.role,
+            "content": msg.content,
+            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "id": msg.id
+        }
+        for msg in messages
+    ]
+
+
+===== FILE: backend/app/database.py =====
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import os
+from pathlib import Path
+
+# SQLite database URL - store in backend directory
+backend_dir = Path(__file__).parent.parent
+db_path = backend_dir / "database.db"
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+engine = create_engine(
+    DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+def get_db():
+    """Dependency for getting database session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def init_db():
+    """Initialize database tables"""
+    from app.models import GameSession, ChatMessage
+    Base.metadata.create_all(bind=engine)
+
+
+===== FILE: backend/app/models.py =====
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from app.database import Base
+
+class GameSession(Base):
+    __tablename__ = "game_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, index=True, nullable=False)
+    scenario = Column(Text, nullable=False)
+    health = Column(Integer, default=100)
+    coins = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("game_sessions.id"), nullable=False)
+    role = Column(String, nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+    session = relationship("GameSession", back_populates="messages")
+
+
+===== FILE: frontend/src/App.jsx =====
+import { useState, useEffect } from 'react';
+import Scenario from './components/Scenario';
+import Stats from './components/Stats';
+import Chat from './components/Chat';
+import ChatSelector from './components/ChatSelector';
+import ImpostorSelection from './components/ImpostorSelection';
+import ApiKeyInput from './components/ApiKeyInput';
+import { gameAPI } from './services/api';
+import './App.css';
+
+function App() {
+  // Game initialization state
+  const [gamePhase, setGamePhase] = useState('api-key'); // 'api-key', 'loading', 'playing', 'selecting', 'result'
+  const [apiKey, setApiKey] = useState('');
+  const [gameId, setGameId] = useState(null);
+  const [initError, setInitError] = useState(null);
+  
+  // Game state
+  const [activeChat, setActiveChat] = useState('yellow');
+  const [questionsLeft, setQuestionsLeft] = useState(30);
+  const [chatHistories, setChatHistories] = useState({
+    red: [],
+    yellow: [],
+    green: [],
+    blue: [],
+  });
+  
+  // Result state
+  const [gameResult, setGameResult] = useState(null);
+  const [actualImpostor, setActualImpostor] = useState(null);
+
+  // Handle API key submission and game initialization
+  const handleApiKeySubmit = async (key) => {
+    setApiKey(key);
+    setGamePhase('loading');
+    setInitError(null);
+    
+    try {
+      const response = await gameAPI.initGame(key);
+      
+      if (response.success) {
+        setGameId(response.game_id);
+        setActualImpostor(response.impostor_color);
+        setGamePhase('playing');
+        // Reset game state
+        setQuestionsLeft(30);
+        setChatHistories({
+          red: [],
+          yellow: [],
+          green: [],
+          blue: [],
+        });
+      } else {
+        setInitError(response.message || 'Failed to initialize game');
+        setGamePhase('api-key');
+      }
+    } catch (err) {
+      console.error('Failed to initialize game:', err);
+      setInitError(err.response?.data?.detail || err.message || 'Failed to connect to server');
+      setGamePhase('api-key');
+    }
+  };
+
+  const handleChatSelect = (color) => {
+    setActiveChat(color);
+  };
+
+  const handleQuestionSent = () => {
+    setQuestionsLeft(prev => {
+      const newQuestionsLeft = Math.max(0, prev - 1);
+      
+      // If questions reach 0, show impostor selection
+      if (newQuestionsLeft === 0) {
+        setGamePhase('selecting');
+      }
+      
+      return newQuestionsLeft;
+    });
+  };
+
+  const handleMessageSent = (color, userMessage, assistantResponse) => {
+    setChatHistories(prev => ({
+      ...prev,
+      [color]: [
+        ...prev[color],
+        { role: 'user', content: userMessage, timestamp: new Date().toISOString() },
+        { role: 'assistant', content: assistantResponse, timestamp: new Date().toISOString() },
+      ],
+    }));
+  };
+
+  const handleSelectImpostor = () => {
+    setGamePhase('selecting');
+  };
+
+  const handleImpostorSelection = async (selectedColor) => {
+    try {
+      const result = await gameAPI.verifyGuess(gameId, selectedColor);
+      
+      setGameResult({
+        type: result.correct ? 'win' : 'lose',
+        message: result.message,
+        selectedColor,
+        actualImpostor: result.actual_impostor,
+      });
+      setGamePhase('result');
+    } catch (err) {
+      console.error('Failed to verify guess:', err);
+      // Fallback to local check
+      const isCorrect = selectedColor === actualImpostor;
+      setGameResult({
+        type: isCorrect ? 'win' : 'lose',
+        message: isCorrect 
+          ? `You found the impostor!`
+          : `Wrong! The impostor was ${actualImpostor.toUpperCase()}.`,
+        selectedColor,
+        actualImpostor,
+      });
+      setGamePhase('result');
+    }
+  };
+
+  const handleBackFromSelection = () => {
+    setGamePhase('playing');
+  };
+
+  const handlePlayAgain = async () => {
+    // Clean up old game
+    if (gameId) {
+      try {
+        await gameAPI.deleteGame(gameId);
+      } catch (err) {
+        console.log('Could not delete old game:', err);
+      }
+    }
+    
+    // Start new game with same API key
+    if (apiKey) {
+      handleApiKeySubmit(apiKey);
+    } else {
+      setGamePhase('api-key');
+      setGameResult(null);
+      setGameId(null);
+    }
+  };
+
+  const handleNewApiKey = () => {
+    setGamePhase('api-key');
+    setApiKey('');
+    setGameResult(null);
+    setGameId(null);
+  };
+
+  // Render API key input screen
+  if (gamePhase === 'api-key' || gamePhase === 'loading') {
+    return (
+      <div className="app-container">
+        <ApiKeyInput 
+          onSubmit={handleApiKeySubmit}
+          loading={gamePhase === 'loading'}
+          error={initError}
+        />
+      </div>
+    );
+  }
+
+  // Render impostor selection screen
+  if (gamePhase === 'selecting') {
+    return (
+      <div className="app-container">
+        <ImpostorSelection 
+          onSelect={handleImpostorSelection}
+          actualImpostor={actualImpostor}
+          onBack={handleBackFromSelection}
+        />
+      </div>
+    );
+  }
+
+  // Render game result screen
+  if (gamePhase === 'result' && gameResult) {
+    return (
+      <div className="app-container">
+        <div className={`game-result ${gameResult.type}`}>
+          <h2>{gameResult.type === 'win' ? '🎉 VICTORY! 🎉' : '❌ DEFEAT ❌'}</h2>
+          <p>{gameResult.message}</p>
+          <div className="result-buttons">
+            <button className="new-game-button" onClick={handlePlayAgain}>
+              Play Again
+            </button>
+            <button className="new-api-key-button" onClick={handleNewApiKey}>
+              Change API Key
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Render main game
+  return (
+    <div className="app-container">
+      <header className="app-header">
+        <h1>Impostor.AI</h1>
+      </header>
+
+      <div className="game-content">
+        <div className="game-info">
+          <Scenario />
+          <Stats 
+            questionsLeft={questionsLeft}
+            onSelectImpostor={handleSelectImpostor}
+          />
+        </div>
+        <div className="game-chat">
+          <div className="chat-header">
+            <ChatSelector 
+              activeChat={activeChat} 
+              onChatSelect={handleChatSelect} 
+            />
+          </div>
+          <Chat 
+            gameId={gameId}
+            color={activeChat}
+            messages={chatHistories[activeChat]}
+            onQuestionSent={handleQuestionSent}
+            onMessageSent={handleMessageSent}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+===== FILE: frontend/src/App.css =====
+.app-container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 20px;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ===== API KEY SCREEN ===== */
+.api-key-screen {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: calc(100vh - 40px);
+  padding: 20px;
+}
+
+.api-key-container {
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  padding: 40px;
+  border-radius: 25px;
+  border: 3px solid var(--sus-red);
+  box-shadow: 
+    0 12px 24px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 0 40px rgba(197, 17, 17, 0.3);
+  max-width: 500px;
+  width: 100%;
+  text-align: center;
+}
+
+.api-key-title {
+  color: var(--text-white);
+  font-size: 2.5rem;
+  margin-bottom: 10px;
+  text-shadow: 
+    2px 2px 0 var(--sus-red),
+    4px 4px 8px rgba(0, 0, 0, 0.5);
+}
+
+.api-key-subtitle {
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  margin-bottom: 30px;
+}
+
+.api-key-form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.api-key-input-wrapper {
+  text-align: left;
+}
+
+.api-key-label {
+  display: block;
+  color: var(--accent-cyan);
+  font-weight: 600;
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  font-size: 0.9rem;
+  letter-spacing: 0.5px;
+}
+
+.api-key-input {
+  width: 100%;
+  padding: 15px 20px;
+  border: 2px solid var(--crew-blue);
+  border-radius: 12px;
+  font-size: 1rem;
+  outline: none;
+  transition: all 0.3s;
+  background: rgba(0, 0, 0, 0.4);
+  color: var(--text-white);
+  font-family: monospace;
+}
+
+.api-key-input::placeholder {
+  color: var(--text-muted);
+}
+
+.api-key-input:focus {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 15px rgba(56, 254, 220, 0.3);
+}
+
+.api-key-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.api-key-hint {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-top: 8px;
+  font-style: italic;
+}
+
+.api-key-error {
+  background: linear-gradient(135deg, var(--emergency-red) 0%, #CC0000 100%);
+  color: white;
+  padding: 15px;
+  border-radius: 10px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.api-key-submit {
+  background: linear-gradient(135deg, var(--safe-green) 0%, #3FB927 100%);
+  color: var(--space-black);
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  padding: 15px 30px;
+  font-size: 1.1rem;
+  font-weight: 700;
+  border-radius: 25px;
+  cursor: pointer;
+  transition: all 0.3s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.api-key-submit:hover:not(:disabled) {
+  background: linear-gradient(135deg, #60FF47 0%, var(--safe-green) 100%);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(80, 239, 57, 0.4);
+}
+
+.api-key-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.loading-spinner {
+  width: 20px;
+  height: 20px;
+  border: 3px solid rgba(0, 0, 0, 0.2);
+  border-top-color: var(--space-black);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.generation-status {
+  margin-top: 20px;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 12px;
+  border-left: 4px solid var(--accent-cyan);
+}
+
+.generation-status p {
+  color: var(--text-white);
+  margin: 8px 0;
+  font-size: 0.95rem;
+  animation: fadeIn 0.5s ease-out forwards;
+  opacity: 0;
+}
+
+.generation-status p:nth-child(1) { animation-delay: 0s; }
+.generation-status p:nth-child(2) { animation-delay: 0.3s; }
+.generation-status p:nth-child(3) { animation-delay: 0.6s; }
+.generation-status p:nth-child(4) { animation-delay: 0.9s; }
+
+@keyframes fadeIn {
+  to { opacity: 1; }
+}
+
+.generation-note {
+  color: var(--text-muted) !important;
+  font-style: italic;
+  font-size: 0.85rem !important;
+  margin-top: 15px !important;
+}
+
+.api-key-info {
+  margin-top: 30px;
+  text-align: left;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 12px;
+  border: 1px solid rgba(56, 254, 220, 0.2);
+}
+
+.api-key-info h3 {
+  color: var(--accent-cyan);
+  font-size: 1rem;
+  margin-bottom: 12px;
+}
+
+.api-key-info ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.api-key-info li {
+  color: var(--text-white);
+  padding: 8px 0;
+  padding-left: 25px;
+  position: relative;
+  font-size: 0.9rem;
+}
+
+.api-key-info li::before {
+  content: '•';
+  color: var(--sus-red);
+  position: absolute;
+  left: 8px;
+  font-weight: bold;
+}
+
+/* ===== HEADER ===== */
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  padding: 25px 30px;
+  border-radius: 20px;
+  border: 3px solid var(--sus-red);
+  box-shadow: 
+    0 8px 16px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.app-header::before {
+  content: '⚠️ EMERGENCY MEETING ⚠️';
+  position: absolute;
+  top: 5px;
+  right: 20px;
+  font-size: 0.7rem;
+  color: var(--emergency-red);
+  font-weight: 700;
+  letter-spacing: 1px;
+  animation: blink 1.5s infinite;
+}
+
+@keyframes blink {
+  0%, 50%, 100% { opacity: 1; }
+  25%, 75% { opacity: 0.3; }
+}
+
+.app-header h1 {
+  color: var(--text-white);
+  font-size: 2.2rem;
+  text-shadow: 
+    2px 2px 0 var(--sus-red),
+    4px 4px 8px rgba(0, 0, 0, 0.5);
+}
+
+.new-game-button {
+  background: linear-gradient(135deg, var(--safe-green) 0%, #3FB927 100%);
+  color: var(--space-black);
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  padding: 12px 24px;
+  font-size: 0.95rem;
+}
+
+.new-game-button:hover {
+  background: linear-gradient(135deg, #60FF47 0%, var(--safe-green) 100%);
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+.new-api-key-button {
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  color: var(--text-white);
+  border: 3px solid var(--crew-blue);
+  padding: 12px 24px;
+  font-size: 0.95rem;
+}
+
+.new-api-key-button:hover {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 15px rgba(56, 254, 220, 0.3);
+}
+
+.result-buttons {
+  display: flex;
+  gap: 15px;
+  justify-content: center;
+  margin-top: 20px;
+}
+
+/* ===== ERROR & LOADING ===== */
+.error-message {
+  background: linear-gradient(135deg, var(--emergency-red) 0%, #CC0000 100%);
+  color: white;
+  padding: 20px;
+  border-radius: 15px;
+  margin-bottom: 20px;
+  text-align: center;
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  box-shadow: 0 4px 12px rgba(255, 0, 0, 0.4);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  flex-shrink: 0;
+}
+
+.loading {
+  text-align: center;
+  color: var(--accent-cyan);
+  font-size: 1.8rem;
+  font-weight: 700;
+  padding: 50px;
+  text-transform: uppercase;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* ===== GAME LAYOUT ===== */
+.game-content {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 20px;
+  height: calc(100vh - 140px);
+  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+}
+
+.game-info {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+
+/* ===== SCROLLBAR STYLING ===== */
+.game-info::-webkit-scrollbar {
+  width: 5px;
+}
+
+.game-info::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 10px;
+}
+
+.game-info::-webkit-scrollbar-thumb {
+  background: rgba(19, 46, 209, 0.4);
+  border-radius: 10px;
+}
+
+.game-info::-webkit-scrollbar-thumb:hover {
+  background: rgba(19, 46, 209, 0.6);
+}
+
+/* ===== SCENARIO & STATS PANELS ===== */
+.scenario-container,
+.stats-container {
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  padding: 25px;
+  border-radius: 20px;
+  border: 3px solid var(--crew-blue);
+  box-shadow: 
+    0 8px 16px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  position: relative;
+  flex-shrink: 0;
+}
+
+.scenario-container::before,
+.stats-container::before {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: 20px;
+  right: 20px;
+  height: 3px;
+  background: linear-gradient(90deg, 
+    transparent 0%, 
+    var(--accent-cyan) 50%, 
+    transparent 100%);
+}
+
+.scenario-container h2,
+.stats-container h2 {
+  color: var(--accent-cyan);
+  margin-bottom: 15px;
+  font-size: 1.4rem;
+  text-shadow: 0 0 10px rgba(56, 254, 220, 0.5);
+}
+
+.scenario-content {
+  color: var(--text-white);
+  line-height: 1.8;
+  font-size: 0.95rem;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 15px;
+  border-radius: 10px;
+  border-left: 4px solid var(--sus-red);
+}
+
+.stats-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.stat-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px;
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: 12px;
+  border: 2px solid rgba(56, 254, 220, 0.3);
+  transition: all 0.3s;
+}
+
+.stat-item:hover {
+  border-color: var(--accent-cyan);
+  background: rgba(56, 254, 220, 0.1);
+  transform: translateX(5px);
+}
+
+.stat-label {
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.85rem;
+  letter-spacing: 0.5px;
+}
+
+.stat-value {
+  font-weight: 700;
+  color: var(--accent-cyan);
+  font-size: 1.4rem;
+  text-shadow: 0 0 10px rgba(56, 254, 220, 0.5);
+}
+
+.select-impostor-button {
+  width: 100%;
+  margin-top: 20px;
+  padding: 15px 20px;
+  background: linear-gradient(135deg, var(--sus-red) 0%, var(--emergency-red) 100%);
+  color: var(--text-white);
+  border: 3px solid var(--emergency-red);
+  border-radius: 10px;
+  font-size: 1.1rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  box-shadow: 
+    0 4px 8px rgba(0, 0, 0, 0.3),
+    0 0 15px rgba(237, 66, 69, 0.4);
+}
+
+.select-impostor-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 
+    0 6px 12px rgba(0, 0, 0, 0.4),
+    0 0 25px rgba(237, 66, 69, 0.6);
+  background: linear-gradient(135deg, var(--emergency-red) 0%, var(--sus-red) 100%);
+}
+
+.select-impostor-button:active {
+  transform: translateY(0);
+}
+
+/* ===== CHAT SELECTOR ===== */
+.chat-selector-container {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 30px;
+  padding: 40px;
+}
+
+.chat-selector-container h2 {
+  color: var(--text-white);
+  font-size: 2rem;
+  text-shadow: 2px 2px 0 var(--sus-red);
+  margin: 0;
+}
+
+.chat-selector {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 30px;
+  max-width: 600px;
+  width: 100%;
+}
+
+.chat-header .chat-selector {
+  display: flex;
+  flex-direction: row;
+  gap: 15px;
+  max-width: 100%;
+  margin-bottom: 15px;
+  justify-content: center;
+}
+
+.chat-square {
+  aspect-ratio: 1;
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  border: 3px solid var(--sus-red);
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 
+    0 4px 8px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.chat-square::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: radial-gradient(circle at center, rgba(255, 255, 255, 0.1) 0%, transparent 70%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.chat-square:hover {
+  transform: translateY(-5px) scale(1.05);
+  box-shadow: 
+    0 8px 20px rgba(237, 66, 69, 0.6),
+    0 0 30px rgba(237, 66, 69, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  border-color: var(--emergency-red);
+}
+
+.chat-square:hover::before {
+  opacity: 1;
+}
+
+.chat-square.active {
+  border-color: var(--accent-cyan);
+  box-shadow: 
+    0 0 20px rgba(56, 254, 220, 0.6),
+    0 0 40px rgba(56, 254, 220, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  transform: scale(1.05);
+}
+
+.chat-square.active::before {
+  opacity: 1;
+  background: radial-gradient(circle at center, rgba(56, 254, 220, 0.2) 0%, transparent 70%);
+}
+
+.chat-icon {
+  width: 80%;
+  height: 80%;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
+  transition: transform 0.3s ease;
+  z-index: 1;
+  position: relative;
+}
+
+.chat-square:hover .chat-icon {
+  transform: scale(1.1);
+}
+
+.chat-header {
+  padding: 15px 20px;
+  background: rgba(0, 0, 0, 0.3);
+  border-bottom: 2px solid var(--sus-red);
+}
+
+.chat-header .chat-square {
+  width: 60px;
+  height: 60px;
+  min-width: 60px;
+  min-height: 60px;
+}
+
+.chat-header .chat-icon {
+  width: 70%;
+  height: 70%;
+}
+
+/* ===== CHAT AREA ===== */
+.game-chat {
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  border-radius: 20px;
+  border: 3px solid var(--sus-red);
+  box-shadow: 
+    0 8px 16px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  height: 100%;
+  min-height: 0;
+}
+
+.game-chat::before {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: 20px;
+  right: 20px;
+  height: 3px;
+  background: linear-gradient(90deg, 
+    transparent 0%, 
+    var(--emergency-red) 50%, 
+    transparent 100%);
+  animation: scanline 3s linear infinite;
+  z-index: 1;
+}
+
+@keyframes scanline {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ===== MESSAGES ===== */
+.messages-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 25px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  background: rgba(0, 0, 0, 0.2);
+  min-height: 0;
+}
+
+.messages-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.messages-list::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 10px;
+}
+
+.messages-list::-webkit-scrollbar-thumb {
+  background: rgba(19, 46, 209, 0.4);
+  border-radius: 10px;
+}
+
+.messages-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(19, 46, 209, 0.6);
+}
+
+.empty-messages {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 50px;
+  font-style: italic;
+  font-size: 1.1rem;
+}
+
+.message {
+  display: flex;
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-user {
+  justify-content: flex-end;
+}
+
+.message-assistant {
+  justify-content: flex-start;
+}
+
+.message-content {
+  max-width: 75%;
+  padding: 15px 20px;
+  border-radius: 18px;
+  position: relative;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* Player messages (You) */
+.message-user .message-content {
+  background: linear-gradient(135deg, var(--crew-blue) 0%, #0E23A3 100%);
+  color: white;
+  border-bottom-right-radius: 4px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+}
+
+/* Crewmate messages - base style */
+.message-assistant .message-content {
+  background: linear-gradient(135deg, #3a3f56 0%, var(--panel-gray) 100%);
+  color: var(--text-white);
+  border-bottom-left-radius: 4px;
+  border: 2px solid var(--accent-cyan);
+  border-left-width: 4px;
+}
+
+/* Color-specific message styles */
+.message-content.message-red {
+  border-color: #C51111;
+}
+
+.message-content.message-yellow {
+  border-color: #f1c40f;
+}
+
+.message-content.message-blue {
+  border-color: #3498db;
+}
+
+.message-content.message-green {
+  border-color: #2ecc71;
+}
+
+.message-role {
+  font-size: 0.75rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+  opacity: 0.9;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.message-user .message-role {
+  color: var(--accent-cyan);
+}
+
+.message-assistant .message-role {
+  color: var(--safe-green);
+}
+
+.message-text {
+  line-height: 1.6;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  font-size: 0.95rem;
+}
+
+.message-text strong {
+  font-weight: 700;
+  color: var(--accent-cyan);
+}
+
+.message-time {
+  font-size: 0.7rem;
+  margin-top: 8px;
+  opacity: 0.5;
+  font-style: italic;
+}
+
+/* Typing indicator */
+.typing {
+  font-style: italic;
+  color: var(--accent-cyan);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.typing::after {
+  content: '...';
+  animation: dots 1.5s steps(3, end) infinite;
+}
+
+@keyframes dots {
+  0%, 20% { content: '.'; }
+  40% { content: '..'; }
+  60%, 100% { content: '...'; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* ===== CHAT INPUT ===== */
+.chat-input-form {
+  display: flex;
+  padding: 20px;
+  border-top: 2px solid rgba(56, 254, 220, 0.3);
+  gap: 12px;
+  background: rgba(0, 0, 0, 0.3);
+  flex-shrink: 0;
+}
+
+.chat-input {
+  flex: 1;
+  padding: 15px 20px;
+  border: 2px solid var(--crew-blue);
+  border-radius: 25px;
+  font-size: 0.95rem;
+  outline: none;
+  transition: all 0.3s;
+  background: rgba(0, 0, 0, 0.4);
+  color: var(--text-white);
+  font-family: inherit;
+}
+
+.chat-input::placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.chat-input:focus {
+  border-color: var(--accent-cyan);
+  background: rgba(0, 0, 0, 0.6);
+  box-shadow: 0 0 15px rgba(56, 254, 220, 0.3);
+}
+
+.chat-input:disabled {
+  background: rgba(0, 0, 0, 0.2);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.chat-send-button {
+  background: linear-gradient(135deg, var(--sus-red) 0%, #9E0000 100%);
+  color: white;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  padding: 15px 30px;
+  font-size: 0.95rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.chat-send-button::before {
+  content: '▶';
+  margin-right: 8px;
+  font-size: 0.8rem;
+}
+
+.chat-send-button:hover:not(:disabled) {
+  background: linear-gradient(135deg, #FF1111 0%, var(--sus-red) 100%);
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+.chat-send-button:disabled {
+  background: linear-gradient(135deg, #555 0%, #333 100%);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ===== IMPOSTOR SELECTION SCREEN ===== */
+.impostor-selection-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 200px);
+  padding: 40px;
+  gap: 30px;
+  position: relative;
+}
+
+.selection-hint {
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  margin-top: -20px;
+}
+
+.back-button {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  padding: 12px 24px;
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  color: var(--text-white);
+  border: 3px solid var(--crew-blue);
+  border-radius: 10px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 
+    0 4px 8px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.back-button:hover {
+  transform: translateX(-3px);
+  border-color: var(--accent-cyan);
+  box-shadow: 
+    0 6px 12px rgba(0, 0, 0, 0.4),
+    0 0 20px rgba(56, 254, 220, 0.4);
+  background: linear-gradient(135deg, var(--space-black) 0%, var(--panel-gray) 100%);
+}
+
+.back-button:active {
+  transform: translateX(0);
+}
+
+.impostor-selection-screen h2 {
+  color: var(--text-white);
+  font-size: 2.5rem;
+  text-shadow: 
+    2px 2px 0 var(--sus-red),
+    0 0 20px rgba(237, 66, 69, 0.6);
+  text-align: center;
+  margin: 0;
+}
+
+.impostor-options {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 30px;
+  max-width: 600px;
+  width: 100%;
+}
+
+.impostor-option {
+  aspect-ratio: 1;
+  background: linear-gradient(135deg, var(--panel-gray) 0%, var(--space-black) 100%);
+  border: 4px solid var(--crew-blue);
+  border-radius: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  position: relative;
+  overflow: hidden;
+  gap: 15px;
+  padding: 20px;
+  box-shadow: 
+    0 4px 8px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.impostor-option::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: radial-gradient(circle at center, rgba(255, 255, 255, 0.1) 0%, transparent 70%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.impostor-option:hover {
+  transform: translateY(-5px) scale(1.05);
+  border-color: var(--accent-cyan);
+  box-shadow: 
+    0 8px 20px rgba(56, 254, 220, 0.6),
+    0 0 30px rgba(56, 254, 220, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.impostor-option:hover::before {
+  opacity: 1;
+}
+
+.impostor-option-icon {
+  width: 60%;
+  height: 60%;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
+  transition: transform 0.3s ease;
+  z-index: 1;
+  position: relative;
+}
+
+.impostor-option:hover .impostor-option-icon {
+  transform: scale(1.1);
+}
+
+.impostor-option-label {
+  color: var(--text-white);
+  font-size: 1.2rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  z-index: 1;
+  position: relative;
+}
+
+/* Color-specific borders */
+.impostor-option-red {
+  border-color: var(--sus-red);
+}
+
+.impostor-option-red:hover {
+  border-color: var(--emergency-red);
+  box-shadow: 
+    0 8px 20px rgba(237, 66, 69, 0.6),
+    0 0 30px rgba(237, 66, 69, 0.4);
+}
+
+.impostor-option-yellow {
+  border-color: #f1c40f;
+}
+
+.impostor-option-yellow:hover {
+  border-color: #f39c12;
+  box-shadow: 
+    0 8px 20px rgba(243, 156, 18, 0.6),
+    0 0 30px rgba(243, 156, 18, 0.4);
+}
+
+.impostor-option-green {
+  border-color: #2ecc71;
+}
+
+.impostor-option-green:hover {
+  border-color: #27ae60;
+  box-shadow: 
+    0 8px 20px rgba(46, 204, 113, 0.6),
+    0 0 30px rgba(46, 204, 113, 0.4);
+}
+
+.impostor-option-blue {
+  border-color: #3498db;
+}
+
+.impostor-option-blue:hover {
+  border-color: #2980b9;
+  box-shadow: 
+    0 8px 20px rgba(52, 152, 219, 0.6),
+    0 0 30px rgba(52, 152, 219, 0.4);
+}
+
+/* ===== GAME RESULT SCREEN ===== */
+.game-result {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 200px);
+  padding: 40px;
+  gap: 30px;
+  text-align: center;
+}
+
+.game-result h2 {
+  font-size: 3rem;
+  margin: 0;
+  text-shadow: 
+    3px 3px 0 rgba(0, 0, 0, 0.5),
+    0 0 30px currentColor;
+}
+
+.game-result.win h2 {
+  color: var(--accent-cyan);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.game-result.lose h2 {
+  color: var(--emergency-red);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.game-result p {
+  color: var(--text-white);
+  font-size: 1.5rem;
+  line-height: 1.6;
+  max-width: 600px;
+  margin: 0;
+  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
+
+.game-result .new-game-button {
+  margin-top: 20px;
+  padding: 15px 40px;
+  font-size: 1.2rem;
+}
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 968px) {
+  .game-content {
+    grid-template-columns: 1fr;
+    gap: 15px;
+  }
+
+  .game-chat {
+    min-height: 500px;
+  }
+
+  .app-header h1 {
+    font-size: 1.5rem;
+  }
+
+  .app-header::before {
+    font-size: 0.6rem;
+    right: 10px;
+  }
+  
+  .chat-selector {
+    gap: 20px;
+  }
+  
+  .chat-header .chat-selector {
+    gap: 10px;
+  }
+  
+  .chat-header .chat-square {
+    width: 50px;
+    height: 50px;
+    min-width: 50px;
+    min-height: 50px;
+  }
+  
+  .api-key-container {
+    padding: 25px;
+  }
+  
+  .api-key-title {
+    font-size: 2rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-container {
+    padding: 10px;
+  }
+
+  .message-content {
+    max-width: 85%;
+  }
+  
+  .chat-selector-container h2 {
+    font-size: 1.5rem;
+  }
+  
+  .chat-selector {
+    gap: 15px;
+    max-width: 100%;
+  }
+  
+  .chat-header .chat-square {
+    width: 45px;
+    height: 45px;
+    min-width: 45px;
+    min-height: 45px;
+  }
+
+  .chat-input-form {
+    padding: 15px;
+    gap: 8px;
+  }
+
+  .chat-send-button {
+    padding: 12px 20px;
+    font-size: 0.85rem;
+  }
+  
+  .result-buttons {
+    flex-direction: column;
+  }
+}
+
+/* ===== UTILITY ANIMATIONS ===== */
+@keyframes glow {
+  0%, 100% {
+    box-shadow: 0 0 5px var(--accent-cyan);
+  }
+  50% {
+    box-shadow: 0 0 20px var(--accent-cyan), 0 0 30px var(--crew-blue);
+  }
+}
+
+.sus-alert {
+  animation: glow 2s ease-in-out infinite;
+}
+===== FILE: frontend/src/services/api.js =====
+import axios from 'axios';
+
+const API_BASE_URL = 'http://localhost:8000/api';
+
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+export const gameAPI = {
+  // Initialize a new game with API key
+  initGame: async (apiKey) => {
+    const response = await api.post('/game/init', { api_key: apiKey });
+    return response.data;
+  },
+
+  // Send a message to a specific player
+  chatWithPlayer: async (gameId, color, message) => {
+    const response = await api.post('/game/chat', {
+      game_id: gameId,
+      color: color,
+      message: message,
+    });
+    return response.data;
+  },
+
+  // Get game state
+  getGameState: async (gameId) => {
+    const response = await api.get(`/game/${gameId}/state`);
+    return response.data;
+  },
+
+  // Get chat history for a player
+  getChatHistory: async (gameId, color) => {
+    const response = await api.get(`/game/${gameId}/history/${color}`);
+    return response.data;
+  },
+
+  // Get player's events (for debugging)
+  getPlayerEvents: async (gameId, color) => {
+    const response = await api.get(`/game/${gameId}/events/${color}`);
+    return response.data;
+  },
+
+  // Verify impostor guess
+  verifyGuess: async (gameId, guess) => {
+    const response = await api.post(`/game/${gameId}/verify?guess=${guess}`);
+    return response.data;
+  },
+
+  // Delete/cleanup game
+  deleteGame: async (gameId) => {
+    const response = await api.delete(`/game/${gameId}`);
+    return response.data;
+  },
+
+  // Legacy methods for backwards compatibility
+  startGame: async (scenario) => {
+    console.warn('startGame is deprecated, use initGame instead');
+    return { session_id: 'legacy', scenario };
+  },
+
+  sendAction: async (sessionId, action) => {
+    console.warn('sendAction is deprecated, use chatWithPlayer instead');
+    return { message: 'Use chatWithPlayer instead' };
+  },
+
+  getState: async (sessionId) => {
+    console.warn('getState is deprecated, use getGameState instead');
+    return {};
+  },
+
+  getMessages: async (sessionId) => {
+    console.warn('getMessages is deprecated, use getChatHistory instead');
+    return { messages: [] };
+  },
+};
+
+export default api;
+===== FILE: frontend/src/components/Chat.jsx =====
+import { useState, useEffect, useRef } from 'react';
+import Message from './Message';
+import { gameAPI } from '../services/api';
+
+function Chat({ gameId, color, messages, onQuestionSent, onMessageSent }) {
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [localMessages, setLocalMessages] = useState([]);
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  // Combine parent messages with local typing state
+  const displayMessages = [...messages, ...localMessages];
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [displayMessages]);
+
+  // Reset local messages when switching chats
+  useEffect(() => {
+    setLocalMessages([]);
+  }, [color]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim() || loading || !gameId) return;
+
+    const userMessage = input.trim();
+    
+    // Add user message locally for immediate feedback
+    setLocalMessages([{ role: 'user', content: userMessage, timestamp: new Date().toISOString() }]);
+    setInput('');
+    setLoading(true);
+
+    try {
+      const response = await gameAPI.chatWithPlayer(gameId, color, userMessage);
+      
+      if (response.response) {
+        // Clear local messages and notify parent
+        setLocalMessages([]);
+        onMessageSent(color, userMessage, response.response);
+        
+        // Decrement questions after successful send
+        if (onQuestionSent) {
+          onQuestionSent();
+        }
+      }
+    } catch (error) {
+      console.error('Failed to send message:', error);
+      // Add error message locally
+      setLocalMessages(prev => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: 'Sorry, something went wrong. Please try again.',
+          timestamp: new Date().toISOString(),
+        }
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getPlayerName = () => {
+    const names = {
+      red: 'Red',
+      yellow: 'Yellow',
+      blue: 'Blue',
+      green: 'Green',
+    };
+    return names[color] || 'Player';
+  };
+
+  return (
+    <div className="chat-container">
+      <div className="messages-list">
+        {displayMessages.length === 0 ? (
+          <div className="empty-messages">
+            Start your investigation! Ask {getPlayerName()} questions to figure out if they're the impostor.
+          </div>
+        ) : (
+          displayMessages.map((message, index) => (
+            <Message 
+              key={index} 
+              message={message} 
+              playerColor={color}
+            />
+          ))
+        )}
+        {loading && (
+          <div className="message message-assistant">
+            <div className="message-content">
+              <div className="message-role">{getPlayerName()}</div>
+              <div className="message-text typing">Thinking...</div>
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+      <form className="chat-input-form" onSubmit={handleSubmit}>
+        <input
+          type="text"
+          className="chat-input"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder={`Ask ${getPlayerName()} a question...`}
+          disabled={loading || !gameId}
+        />
+        <button
+          type="submit"
+          className="chat-send-button"
+          disabled={loading || !input.trim() || !gameId}
+        >
+          Send
+        </button>
+      </form>
+    </div>
+  );
+}
+
+export default Chat;
+===== FILE: frontend/src/components/Message.jsx =====
+import { formatMessage } from '../utils/formatMessage';
+
+function Message({ message }) {
+  const isUser = message.role === 'user';
+  
+  // Format assistant messages (convert markdown to HTML)
+  // Keep user messages plain text
+  const displayContent = isUser 
+    ? message.content 
+    : formatMessage(message.content);
+  
+  return (
+    <div className={`message ${isUser ? 'message-user' : 'message-assistant'}`}>
+      <div className="message-content">
+        <div className="message-role">{isUser ? 'You' : 'Game Master'}</div>
+        {isUser ? (
+          <div className="message-text">{message.content}</div>
+        ) : (
+          <div 
+            className="message-text" 
+            dangerouslySetInnerHTML={{ __html: displayContent }}
+          />
+        )}
+        {message.timestamp && (
+          <div className="message-time">
+            {new Date(message.timestamp).toLocaleTimeString()}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default Message;
+
+
+===== FILE: frontend/src/components/ChatSelector.jsx =====
+import redIcon from '../assets/red_icon.png';
+import yellowIcon from '../assets/yellow_icon.png';
+import greenIcon from '../assets/green_icon.png';
+import blueIcon from '../assets/blue_icon.png';
+
+const chatIcons = {
+  red: redIcon,
+  yellow: yellowIcon,
+  green: greenIcon,
+  blue: blueIcon,
+};
+
+function ChatSelector({ activeChat, onChatSelect }) {
+  const colors = ['red', 'yellow', 'green', 'blue'];
+
+  return (
+    <div className="chat-selector">
+      {colors.map((color) => (
+        <div
+          key={color}
+          className={`chat-square ${activeChat === color ? 'active' : ''}`}
+          onClick={() => onChatSelect(color)}
+        >
+          <img 
+            src={chatIcons[color]} 
+            alt={`${color} chat`}
+            className="chat-icon"
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default ChatSelector;
+
+
+===== FILE: frontend/src/components/ImpostorSelection.jsx =====
+import redIcon from '../assets/red_icon.png';
+import yellowIcon from '../assets/yellow_icon.png';
+import greenIcon from '../assets/green_icon.png';
+import blueIcon from '../assets/blue_icon.png';
+
+const impostorIcons = {
+  red: redIcon,
+  yellow: yellowIcon,
+  green: greenIcon,
+  blue: blueIcon,
+};
+
+function ImpostorSelection({ onSelect, actualImpostor, onBack }) {
+  const colors = ['red', 'yellow', 'green', 'blue'];
+  
+  const handleSelect = (color) => {
+    const isCorrect = color === actualImpostor;
+    onSelect(color, isCorrect);
+  };
+  
+  return (
+    <div className="impostor-selection-screen">
+      <button className="back-button" onClick={onBack}>
+        ← Back
+      </button>
+      <h2>Who is the Impostor?</h2>
+      <div className="impostor-options">
+        {colors.map(color => (
+          <button 
+            key={color}
+            className={`impostor-option impostor-option-${color}`}
+            onClick={() => handleSelect(color)}
+          >
+            <img 
+              src={impostorIcons[color]} 
+              alt={`${color} crewmate`}
+              className="impostor-option-icon"
+            />
+            <span className="impostor-option-label">{color.toUpperCase()}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default ImpostorSelection;
+
+
+===== FILE: frontend/src/components/ApiKeyInput.jsx =====
+import { useState } from 'react';
+
+function ApiKeyInput({ onSubmit, loading, error }) {
+  const [apiKey, setApiKey] = useState('');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (apiKey.trim()) {
+      onSubmit(apiKey.trim());
+    }
+  };
+
+  return (
+    <div className="api-key-screen">
+      <div className="api-key-container">
+        <h1 className="api-key-title">🚀 Impostor.AI</h1>
+        <p className="api-key-subtitle">An Among Us-style deduction game powered by AI</p>
+        
+        <form onSubmit={handleSubmit} className="api-key-form">
+          <div className="api-key-input-wrapper">
+            <label htmlFor="api-key" className="api-key-label">
+              Enter your OpenAI API Key
+            </label>
+            <input
+              id="api-key"
+              type="password"
+              className="api-key-input"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="sk-..."
+              disabled={loading}
+              autoComplete="off"
+            />
+            <p className="api-key-hint">
+              Your API key is used to power the AI players. It's only stored locally during your session.
+            </p>
+          </div>
+          
+          {error && (
+            <div className="api-key-error">
+              {error}
+            </div>
+          )}
+          
+          <button
+            type="submit"
+            className="api-key-submit"
+            disabled={!apiKey.trim() || loading}
+          >
+            {loading ? (
+              <>
+                <span className="loading-spinner"></span>
+                Generating Game...
+              </>
+            ) : (
+              'Start Game'
+            )}
+          </button>
+        </form>
+        
+        {loading && (
+          <div className="generation-status">
+            <p>🎲 Generating event history...</p>
+            <p>🔍 Assigning impostor...</p>
+            <p>🎭 Preparing AI players...</p>
+            <p className="generation-note">This may take 30-60 seconds</p>
+          </div>
+        )}
+        
+        <div className="api-key-info">
+          <h3>How to play:</h3>
+          <ul>
+            <li>Chat with 4 AI crewmates (Red, Yellow, Blue, Green)</li>
+            <li>One of them is secretly the Impostor</li>
+            <li>Ask questions to figure out who's lying</li>
+            <li>You have 30 questions to find the Impostor</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default ApiKeyInput;
+===== FILE: frontend/src/components/Stats.jsx =====
+function Stats({ questionsLeft, onSelectImpostor }) {
+  return (
+    <div className="stats-container">
+      <h2>Questions Left</h2>
+      <div className="stats-grid">
+        <div className="stat-item">
+          <span className="stat-label">Questions:</span>
+          <span className="stat-value">{questionsLeft || 30}</span>
+        </div>
+      </div>
+      <button 
+        className="select-impostor-button"
+        onClick={onSelectImpostor}
+      >
+        Select Impostor
+      </button>
+    </div>
+  );
+}
+
+export default Stats;
+
+
+===== FILE: frontend/src/components/Scenario.jsx =====
+function Scenario() {
+  const scenarioText = "You're playing Among Us. One of these 4 is the impostor. Chat with them and ask questions to figure out who the impostor is.";
+
+  return (
+    <div className="scenario-container">
+      <h2>Scenario</h2>
+      <div className="scenario-content">{scenarioText}</div>
+    </div>
+  );
+}
+
+export default Scenario;
+

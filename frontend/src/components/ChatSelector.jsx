@@ -11,7 +11,7 @@ const chatIcons = {
 };
 
 function ChatSelector({ activeChat, onChatSelect }) {
-  const colors = ['red', 'yellow', 'green', 'blue'];
+  const colors = ['red', 'yellow', 'blue', 'green'];
 
   return (
     <div className="chat-selector">
