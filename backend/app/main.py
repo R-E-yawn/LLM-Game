@@ -20,6 +20,7 @@ from app.game_state import (
 )
 from app.llm_service import OpenAIService
 from app.event_generator import generate_game_data, PLAYER_COLORS, COLOR_TO_PLAYER
+from app.guardrails import apply_output_guardrail
 
 app = FastAPI(title="Impostor.AI Game API")
 
@@ -150,7 +151,7 @@ async def chat_with_player(request: PlayerChatRequest, db: Session = Depends(get
     chat_history.append({"role": "user", "content": message})
     
     llm_service = OpenAIService(api_key)
-    response = llm_service.generate_response(
+    raw_response = llm_service.generate_response(
         player_name=player_name,
         color=color,
         player_events=player_events,
@@ -159,6 +160,9 @@ async def chat_with_player(request: PlayerChatRequest, db: Session = Depends(get
         player_message=message,
         chat_history=chat_history[:-1]
     )
+    
+    # Apply output guardrail to check for confessions
+    response = apply_output_guardrail(raw_response)
     
     chat_history.append({"role": "assistant", "content": response})
     game_state["chat_histories"][color] = chat_history
